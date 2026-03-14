@@ -2,6 +2,8 @@
 Batch TeraBox Downloader — reads links from Excel, downloads all media files,
 and writes status (Success/Failed) back into the Excel file.
 
+Supports multiprocessing: runs multiple downloads in parallel.
+
 Excel format:
   Column A: TeraBox Link
   Column B: Status (Success / Failed: reason)
@@ -10,9 +12,10 @@ Excel format:
   Column E: Date (download timestamp)
 
 Usage:
-  python batch_downloader.py                          # default: links.xlsx
+  python batch_downloader.py                          # default: links.xlsx, 2 workers
   python batch_downloader.py --input mylinks.xlsx     # custom Excel file
-  python batch_downloader.py --input links.xlsx --output-dir D:\\Videos
+  python batch_downloader.py --workers 3              # 3 parallel downloads
+  python batch_downloader.py --input links.xlsx --output-dir D:\\Videos --workers 4
 """
 
 import argparse
@@ -21,6 +24,7 @@ import sys
 import time
 import logging
 from datetime import datetime
+from multiprocessing import Pool, cpu_count
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -28,12 +32,11 @@ from openpyxl.styles import Font, PatternFill, Alignment
 # ── Import streamer_v2 functions ─────────────────────────────────────────────
 # Add project root to path so we can import sibling modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from streamer_v2 import get_download_link, download_file
 from config import SUPPORTED_DOMAINS
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] [PID %(process)d] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -104,8 +107,60 @@ def load_excel(filepath: str):
     return wb, ws
 
 
-def process_downloads(input_file: str, output_dir: str, max_retries: int = 3):
-    """Main batch download loop: read Excel, download each link, write status."""
+def _download_one(args: tuple) -> dict:
+    """
+    Worker function for multiprocessing — downloads a single TeraBox link.
+    Must be a top-level function (picklable).
+    Returns a result dict: {row_idx, link, status, filename, size_mb, timestamp, error}
+    """
+    row_idx, link, output_dir, max_retries = args
+
+    # Import inside worker so each process gets its own module instance
+    from streamer_v2 import get_download_link, download_file
+
+    result = {
+        "row_idx": row_idx,
+        "link": link,
+        "status": "Failed",
+        "filename": None,
+        "size_mb": None,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "error": None,
+    }
+
+    try:
+        logger.info(f"[Row {row_idx}] Getting download link: {link[:60]}...")
+        api_result = get_download_link(link, max_retries=max_retries)
+
+        if "download_url" not in api_result:
+            error_msg = api_result.get("error", "No download URL returned")
+            raise RuntimeError(error_msg)
+
+        dl_url = api_result["download_url"]
+
+        logger.info(f"[Row {row_idx}] Downloading file...")
+        filepath = download_file(dl_url, output_dir=output_dir)
+        filename = os.path.basename(filepath)
+        actual_size = os.path.getsize(filepath) / (1024 * 1024)
+
+        result["status"] = "Success"
+        result["filename"] = filename
+        result["size_mb"] = round(actual_size, 2)
+        result["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"[Row {row_idx}] SUCCESS: {filename} ({actual_size:.1f} MB)")
+
+    except Exception as e:
+        error_msg = str(e)[:100]
+        result["error"] = error_msg
+        result["status"] = f"Failed: {error_msg}"
+        result["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.error(f"[Row {row_idx}] FAILED: {error_msg}")
+
+    return result
+
+
+def process_downloads(input_file: str, output_dir: str, max_retries: int = 3, workers: int = 2):
+    """Main batch download: read Excel, download links in parallel, write status."""
 
     if not os.path.exists(input_file):
         logger.warning(f"Excel file not found: {input_file}")
@@ -126,16 +181,10 @@ def process_downloads(input_file: str, output_dir: str, max_retries: int = 3):
     ws.column_dimensions["D"].width = 12
     ws.column_dimensions["E"].width = 22
 
-    succeeded = 0
-    failed = 0
+    # ── Collect tasks ────────────────────────────────────────────────────────
+    tasks = []       # (row_idx, link, output_dir, max_retries)
     skipped = 0
-
-    print(f"\n{'='*60}")
-    print(f"  Batch TeraBox Downloader")
-    print(f"  Input:  {input_file}")
-    print(f"  Output: {output_dir}")
-    print(f"  Links:  {total_rows}")
-    print(f"{'='*60}\n")
+    invalid = 0
 
     for row_idx in range(2, ws.max_row + 1):
         link = ws.cell(row=row_idx, column=1).value
@@ -149,7 +198,7 @@ def process_downloads(input_file: str, output_dir: str, max_retries: int = 3):
 
         # Skip already successful downloads
         if status and str(status).strip().lower() == "success":
-            logger.info(f"[{row_idx-1}/{total_rows}] Skipping (already downloaded): {link[:60]}...")
+            logger.info(f"Skipping (already downloaded): {link[:60]}...")
             for col in range(1, 6):
                 ws.cell(row=row_idx, column=col).fill = SKIP_FILL
             skipped += 1
@@ -157,63 +206,61 @@ def process_downloads(input_file: str, output_dir: str, max_retries: int = 3):
 
         # Validate URL
         if not is_terabox_url(link):
-            logger.warning(f"[{row_idx-1}/{total_rows}] Invalid URL: {link[:60]}...")
+            logger.warning(f"Invalid URL: {link[:60]}...")
             ws.cell(row=row_idx, column=2).value = "Failed: Invalid TeraBox URL"
             for col in range(1, 6):
                 ws.cell(row=row_idx, column=col).fill = FAIL_FILL
-            failed += 1
-            wb.save(input_file)
+            invalid += 1
             continue
 
-        # ── Download ─────────────────────────────────────────────────
-        print(f"\n--- [{row_idx-1}/{total_rows}] {link} ---")
+        tasks.append((row_idx, link, output_dir, max_retries))
 
-        try:
-            # Step 1: Get download URL via streamer
-            logger.info("Getting download link via teraboxstreamer.com...")
-            result = get_download_link(link, max_retries=max_retries)
+    # Save any skip/invalid changes before starting pool
+    wb.save(input_file)
 
-            if "download_url" not in result:
-                error_msg = result.get("error", "No download URL returned")
-                raise RuntimeError(error_msg)
+    if not tasks:
+        logger.info("No new links to download.")
+        wb.close()
+        return
 
-            dl_url = result["download_url"]
-            video_name = result.get("video_name", "")
-            file_size_mb = result.get("file_size_mb", 0)
+    # Clamp workers to number of tasks
+    actual_workers = min(workers, len(tasks))
 
-            # Step 2: Download the file
-            logger.info("Downloading file...")
-            filepath = download_file(dl_url, output_dir=output_dir)
-            filename = os.path.basename(filepath)
-            actual_size = os.path.getsize(filepath) / (1024 * 1024)
+    print(f"\n{'='*60}")
+    print(f"  Batch TeraBox Downloader (Multiprocessing)")
+    print(f"  Input:   {input_file}")
+    print(f"  Output:  {output_dir}")
+    print(f"  Links:   {len(tasks)} to download, {skipped} skipped, {invalid} invalid")
+    print(f"  Workers: {actual_workers}")
+    print(f"{'='*60}\n")
 
-            # Step 3: Write success to Excel
-            ws.cell(row=row_idx, column=2).value = "Success"
-            ws.cell(row=row_idx, column=3).value = filename
-            ws.cell(row=row_idx, column=4).value = round(actual_size, 2)
-            ws.cell(row=row_idx, column=5).value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for col in range(1, 6):
-                ws.cell(row=row_idx, column=col).fill = SUCCESS_FILL
+    # ── Run downloads in parallel ────────────────────────────────────────────
+    succeeded = 0
+    failed = invalid  # count invalid URLs as failed
+
+    with Pool(processes=actual_workers) as pool:
+        results = pool.map(_download_one, tasks)
+
+    # ── Write results back to Excel ──────────────────────────────────────────
+    for res in results:
+        row_idx = res["row_idx"]
+
+        ws.cell(row=row_idx, column=2).value = res["status"]
+        ws.cell(row=row_idx, column=3).value = res["filename"]
+        ws.cell(row=row_idx, column=4).value = res["size_mb"]
+        ws.cell(row=row_idx, column=5).value = res["timestamp"]
+
+        if res["status"] == "Success":
+            fill = SUCCESS_FILL
             succeeded += 1
-            logger.info(f"SUCCESS: {filename} ({actual_size:.1f} MB)")
-
-        except Exception as e:
-            error_msg = str(e)[:100]
-            logger.error(f"FAILED: {error_msg}")
-            ws.cell(row=row_idx, column=2).value = f"Failed: {error_msg}"
-            ws.cell(row=row_idx, column=5).value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for col in range(1, 6):
-                ws.cell(row=row_idx, column=col).fill = FAIL_FILL
+        else:
+            fill = FAIL_FILL
             failed += 1
 
-        # Save after each row (so progress is preserved if script is interrupted)
-        wb.save(input_file)
-        logger.info(f"Excel saved. Progress: {succeeded} ok / {failed} fail / {skipped} skip")
+        for col in range(1, 6):
+            ws.cell(row=row_idx, column=col).fill = fill
 
-        # Brief pause between downloads to avoid rate limiting
-        if row_idx < ws.max_row:
-            time.sleep(2)
-
+    wb.save(input_file)
     wb.close()
 
     # ── Summary ──────────────────────────────────────────────────────────────
@@ -223,6 +270,7 @@ def process_downloads(input_file: str, output_dir: str, max_retries: int = 3):
     print(f"  Failed:    {failed}")
     print(f"  Skipped:   {skipped}")
     print(f"  Total:     {total_rows}")
+    print(f"  Workers:   {actual_workers}")
     print(f"  Excel:     {os.path.abspath(input_file)}")
     print(f"{'='*60}\n")
 
@@ -247,9 +295,15 @@ def main():
         default=3,
         help="Max retries per link (default: 3)",
     )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=2,
+        help="Number of parallel downloads (default: 2, max recommended: 4)",
+    )
 
     args = parser.parse_args()
-    process_downloads(args.input, args.output_dir, max_retries=args.retries)
+    process_downloads(args.input, args.output_dir, max_retries=args.retries, workers=args.workers)
 
 
 if __name__ == "__main__":
