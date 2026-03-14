@@ -129,7 +129,9 @@ class TeraBoxAuth:
     def get_public_key(self) -> RSA.RsaKey:
         """
         Step 1: Get RSA public key from /passport/getpubkey.
-        The key is AES-128-CBC encrypted: decrypt pp1 using pp2 as key.
+        The key is AES encrypted: decrypt pp1 using pp2 as key.
+        TeraBox uses CryptoJS-style encryption: key and IV are both the raw
+        pp2 string (UTF-8 bytes), pp1 is standard base64 ciphertext.
         """
         url = f"{self.host}/passport/getpubkey"
         params = {
@@ -146,83 +148,119 @@ class TeraBoxAuth:
         if data.get("code") != 0:
             raise RuntimeError(f"getpubkey failed: {data}")
 
+        # Check if pubkey is returned directly (some API versions)
+        if "pubkey" in data.get("data", {}):
+            pem_key = data["data"]["pubkey"]
+            logger.info("RSA public key returned directly (pubkey field).")
+            return RSA.import_key(pem_key)
+
         pp1 = data["data"]["pp1"]
         pp2 = data["data"]["pp2"]
 
         logger.info(f"pp1 length: {len(pp1)}, pp2 length: {len(pp2)}")
 
-        # AES-128-CBC decrypt pp1 using pp2
-        # pp2 may be base64-encoded or a raw string key.
+        # Build candidate keys to try (in priority order)
+        candidate_keys = []
+        raw_pp2 = pp2.encode("utf-8")
+
+        # CryptoJS pattern: raw string as key (if 16/24/32 bytes)
+        if len(raw_pp2) in (16, 24, 32):
+            candidate_keys.append(("raw_pp2", raw_pp2))
+
+        # Base64-decoded pp2
         try:
-            key_bytes = _url_safe_b64decode(pp2)
+            decoded_pp2 = base64.b64decode(
+                pp2 + "=" * ((4 - len(pp2) % 4) % 4)
+            )
+            if len(decoded_pp2) in (16, 24, 32):
+                candidate_keys.append(("b64_pp2", decoded_pp2))
         except Exception:
-            key_bytes = pp2.encode("utf-8")
+            pass
 
-        if len(key_bytes) not in (16, 24, 32):
-            # Use MD5 of pp2 to derive a 16-byte AES-128 key
-            key_bytes = hashlib.md5(pp2.encode("utf-8")).digest()
-            logger.info("Derived AES key via MD5 (pp2 decoded len was not 16/24/32)")
+        # URL-safe base64 decoded pp2
+        try:
+            decoded_pp2_url = _url_safe_b64decode(pp2)
+            if len(decoded_pp2_url) in (16, 24, 32):
+                candidate_keys.append(("urlsafe_b64_pp2", decoded_pp2_url))
+        except Exception:
+            pass
 
-        cipher_bytes = _url_safe_b64decode(pp1)
+        # MD5 fallback (always 16 bytes)
+        candidate_keys.append(("md5_pp2", hashlib.md5(raw_pp2).digest()))
 
-        # Try multiple IV strategies: pp1 may or may not have IV prepended.
+        # Decode pp1 ciphertext — try standard base64, then URL-safe
+        cipher_bytes = None
+        for decode_name, decode_fn in [
+            ("std_b64", lambda s: base64.b64decode(s + "=" * ((4 - len(s) % 4) % 4))),
+            ("urlsafe_b64", _url_safe_b64decode),
+        ]:
+            try:
+                cipher_bytes = decode_fn(pp1)
+                logger.info(f"pp1 decoded ({decode_name}): {len(cipher_bytes)} bytes")
+                break
+            except Exception as e:
+                logger.debug(f"pp1 decode ({decode_name}) failed: {e}")
+
+        if cipher_bytes is None:
+            raise RuntimeError("Could not base64-decode pp1")
+
+        # Try all combinations of key, IV strategy, and AES mode
         pem_key = None
 
-        # Strategy 1: IV is first 16 bytes of cipher_bytes
-        if len(cipher_bytes) > 16 and (len(cipher_bytes) - 16) % 16 == 0:
-            iv = cipher_bytes[:16]
-            encrypted = cipher_bytes[16:]
-            try:
-                cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
-                decrypted = cipher.decrypt(encrypted)
-                pad_len = decrypted[-1]
-                if 0 < pad_len <= 16:
-                    pem_key = decrypted[:-pad_len].decode("utf-8")
-                    logger.info("Decrypted with IV from pp1 prefix.")
-            except Exception as e:
-                logger.debug(f"Strategy 1 (IV from pp1) failed: {e}")
+        for key_name, key_bytes in candidate_keys:
+            if pem_key:
+                break
 
-        # Strategy 2: IV = key itself (first 16 bytes), entire pp1 is ciphertext
-        if pem_key is None:
-            iv = key_bytes[:16]
-            encrypted = cipher_bytes
-            # Pad ciphertext to 16-byte boundary if needed
-            if len(encrypted) % 16 != 0:
-                encrypted = encrypted + b'\x00' * (16 - len(encrypted) % 16)
-            try:
-                cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
-                decrypted = cipher.decrypt(encrypted)
-                pad_len = decrypted[-1]
-                if 0 < pad_len <= 16:
-                    pem_key = decrypted[:-pad_len].decode("utf-8")
-                else:
-                    pem_key = decrypted.rstrip(b'\x00').decode("utf-8")
-                logger.info("Decrypted with IV from key bytes.")
-            except Exception as e:
-                logger.debug(f"Strategy 2 (IV from key) failed: {e}")
+            iv_strategies = [
+                ("key_as_iv", key_bytes[:16]),
+                ("zeros_iv", b'\x00' * 16),
+            ]
+            if len(cipher_bytes) > 16:
+                iv_strategies.insert(0, ("pp1_prefix_iv", cipher_bytes[:16]))
 
-        # Strategy 3: Zero IV, entire pp1 is ciphertext
-        if pem_key is None:
-            iv = b'\x00' * 16
-            encrypted = cipher_bytes
-            if len(encrypted) % 16 != 0:
-                encrypted = encrypted + b'\x00' * (16 - len(encrypted) % 16)
-            try:
-                cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
-                decrypted = cipher.decrypt(encrypted)
-                pad_len = decrypted[-1]
-                if 0 < pad_len <= 16:
-                    pem_key = decrypted[:-pad_len].decode("utf-8")
-                else:
-                    pem_key = decrypted.rstrip(b'\x00').decode("utf-8")
-                logger.info("Decrypted with zero IV.")
-            except Exception as e:
-                logger.debug(f"Strategy 3 (zero IV) failed: {e}")
+            for iv_name, iv in iv_strategies:
+                if pem_key:
+                    break
+
+                ct = cipher_bytes[16:] if iv_name == "pp1_prefix_iv" else cipher_bytes
+
+                for mode_name, mode_args in [
+                    ("CBC", (AES.MODE_CBC, iv)),
+                    ("ECB", (AES.MODE_ECB,)),
+                ]:
+                    if pem_key:
+                        break
+
+                    padded_ct = ct
+                    if len(padded_ct) % 16 != 0:
+                        padded_ct += b'\x00' * (16 - len(padded_ct) % 16)
+
+                    try:
+                        cipher = AES.new(key_bytes, *mode_args)
+                        decrypted = cipher.decrypt(padded_ct)
+
+                        # PKCS7 unpadding
+                        pad_len = decrypted[-1]
+                        if 0 < pad_len <= 16 and all(
+                            b == pad_len for b in decrypted[-pad_len:]
+                        ):
+                            candidate = decrypted[:-pad_len].decode("utf-8", errors="ignore")
+                        else:
+                            candidate = decrypted.rstrip(b'\x00').decode("utf-8", errors="ignore")
+
+                        if "BEGIN" in candidate and "KEY" in candidate:
+                            pem_key = candidate.strip()
+                            logger.info(
+                                f"Decrypted RSA key: key={key_name}, iv={iv_name}, mode={mode_name}"
+                            )
+                    except Exception as e:
+                        logger.debug(f"  {key_name}/{iv_name}/{mode_name}: {e}")
 
         if pem_key is None or "KEY" not in pem_key.upper():
             raise RuntimeError(
                 f"Could not decrypt RSA key from pp1/pp2. "
-                f"pp1 decoded len={len(cipher_bytes)}, key len={len(key_bytes)}"
+                f"pp1 decoded len={len(cipher_bytes)}, "
+                f"keys tried: {[k[0] for k in candidate_keys]}"
             )
 
         logger.info("RSA public key obtained.")
