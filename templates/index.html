@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TeraBox Video Downloader</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <div class="logo">
+                <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
+                    <rect width="36" height="36" rx="8" fill="#6C5CE7"/>
+                    <path d="M10 18L16 24L26 12" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <h1>TeraBox <span class="accent">Downloader</span></h1>
+            </div>
+            <div class="status-indicator" id="statusIndicator">
+                <span class="status-dot"></span>
+                <span class="status-text">Checking...</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container">
+            <h2>Download TeraBox Videos & Files</h2>
+            <p class="subtitle">Paste any TeraBox share link to download videos, files, and more. Fast, free, and no limits.</p>
+
+            <!-- URL Input -->
+            <div class="input-group">
+                <input 
+                    type="text" 
+                    id="urlInput" 
+                    placeholder="Paste TeraBox link here... (e.g., https://terabox.com/s/...)"
+                    autocomplete="off"
+                    spellcheck="false"
+                >
+                <div class="input-buttons">
+                    <button class="btn btn-paste" id="btnPaste" title="Paste from clipboard">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                        </svg>
+                        Paste
+                    </button>
+                    <button class="btn btn-primary" id="btnDownload">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="7 10 12 15 17 10"/>
+                            <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                        Download
+                    </button>
+                </div>
+            </div>
+
+            <!-- Error Message -->
+            <div class="error-msg" id="errorMsg" style="display: none;"></div>
+        </div>
+    </section>
+
+    <!-- Loading Spinner -->
+    <section class="loading-section" id="loadingSection" style="display: none;">
+        <div class="container">
+            <div class="spinner-wrapper">
+                <div class="spinner"></div>
+                <p>Resolving download link...</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Results Section -->
+    <section class="results-section" id="resultsSection" style="display: none;">
+        <div class="container">
+            <h3>File Details</h3>
+            <div class="file-list" id="fileList"></div>
+        </div>
+    </section>
+
+    <!-- Login Modal -->
+    <div class="modal-overlay" id="loginModal" style="display: none;">
+        <div class="modal">
+            <h3>TeraBox Login Required</h3>
+            <p>Enter your TeraBox account credentials to enable downloads.</p>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label for="loginEmail">Email</label>
+                    <input type="email" id="loginEmail" placeholder="your@email.com" required>
+                </div>
+                <div class="form-group">
+                    <label for="loginPassword">Password</label>
+                    <input type="password" id="loginPassword" placeholder="Your TeraBox password" required>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="btnLoginCancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="btnLoginSubmit">Login</button>
+                </div>
+                <div class="login-error" id="loginError" style="display: none;"></div>
+            </form>
+        </div>
+    </div>
+
+    <!-- How-To Section -->
+    <section class="howto-section">
+        <div class="container">
+            <h3>How to Download from TeraBox</h3>
+            <div class="steps-grid">
+                <div class="step-card">
+                    <div class="step-number">1</div>
+                    <h4>Copy Link</h4>
+                    <p>Copy the TeraBox share link from your browser or message.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">2</div>
+                    <h4>Paste URL</h4>
+                    <p>Paste it into the input box above and click "Download".</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">3</div>
+                    <h4>Preview Details</h4>
+                    <p>See the file name, size, and thumbnail preview.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">4</div>
+                    <h4>Download File</h4>
+                    <p>Click the download button to save the file to your device.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- FAQ Section -->
+    <section class="faq-section">
+        <div class="container">
+            <h3>Frequently Asked Questions</h3>
+            <div class="faq-list">
+                <div class="faq-item">
+                    <button class="faq-question" onclick="toggleFaq(this)">
+                        What TeraBox links are supported?
+                        <span class="faq-arrow">▼</span>
+                    </button>
+                    <div class="faq-answer">
+                        <p>We support all TeraBox domains including terabox.com, terabox.app, 1024tera.com, freeterabox.com, mirrobox.com, nephobox.com, and more.</p>
+                    </div>
+                </div>
+                <div class="faq-item">
+                    <button class="faq-question" onclick="toggleFaq(this)">
+                        Is there a file size limit?
+                        <span class="faq-arrow">▼</span>
+                    </button>
+                    <div class="faq-answer">
+                        <p>No file size limit! The downloader supports files of any size with resume capability for large downloads.</p>
+                    </div>
+                </div>
+                <div class="faq-item">
+                    <button class="faq-question" onclick="toggleFaq(this)">
+                        Why do I need to login?
+                        <span class="faq-arrow">▼</span>
+                    </button>
+                    <div class="faq-answer">
+                        <p>TeraBox requires authentication to generate download links. Your credentials are stored locally and never shared.</p>
+                    </div>
+                </div>
+                <div class="faq-item">
+                    <button class="faq-question" onclick="toggleFaq(this)">
+                        Is this safe to use?
+                        <span class="faq-arrow">▼</span>
+                    </button>
+                    <div class="faq-answer">
+                        <p>Yes! This runs entirely on your local machine. No data is sent to any third party. All downloads go directly through the TeraBox API.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <p>&copy; 2026 TeraBox Downloader. For personal use only.</p>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
