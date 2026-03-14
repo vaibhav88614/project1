@@ -18,6 +18,7 @@ import time
 import requests
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
+from Crypto.Util.Padding import unpad
 
 import config
 
@@ -129,11 +130,7 @@ class TeraBoxAuth:
     def get_public_key(self) -> RSA.RsaKey:
         """
         Step 1: Get RSA public key from /passport/getpubkey.
-        The API may return the key in several ways:
-          - Directly as 'pubkey' field (PEM string)
-          - pp1 as base64 of DER-encoded key (no encryption)
-          - pp1 as base64 PEM body (wrap with headers to get PEM)
-          - pp1 AES-encrypted with pp2 as key
+        Tries every known TeraBox key format and decryption method.
         """
         url = f"{self.host}/passport/getpubkey"
         params = {
@@ -150,16 +147,32 @@ class TeraBoxAuth:
         if data.get("code") != 0:
             raise RuntimeError(f"getpubkey failed: {data}")
 
-        # Check if pubkey is returned directly (some API versions)
-        if "pubkey" in data.get("data", {}):
-            pem_key = data["data"]["pubkey"]
+        resp_data = data.get("data", {})
+        logger.info(f"getpubkey response keys: {list(resp_data.keys())}")
+
+        # ── Direct pubkey field ──
+        if "pubkey" in resp_data:
+            pem_key = resp_data["pubkey"]
             logger.info("RSA public key returned directly (pubkey field).")
             return RSA.import_key(pem_key)
 
-        pp1 = data["data"]["pp1"]
-        pp2 = data["data"]["pp2"]
+        # ── Direct key field ──
+        if "key" in resp_data:
+            try:
+                key = RSA.import_key(resp_data["key"])
+                logger.info("RSA key from 'key' field.")
+                return key
+            except Exception as e:
+                logger.debug(f"Direct 'key' field import failed: {e}")
+
+        pp1 = resp_data.get("pp1", "")
+        pp2 = resp_data.get("pp2", "")
+
+        if not pp1:
+            raise RuntimeError(f"No pubkey/pp1 in response. Keys: {list(resp_data.keys())}")
 
         logger.info(f"pp1 length: {len(pp1)}, pp2 length: {len(pp2)}")
+        logger.info(f"pp1 first 20 chars: {pp1[:20]}")
 
         # Decode pp1 from base64
         pp1_bytes = None
@@ -177,145 +190,158 @@ class TeraBoxAuth:
         if pp1_bytes is None:
             raise RuntimeError("Could not base64-decode pp1")
 
+        logger.info(f"pp1 first 8 bytes hex: {pp1_bytes[:8].hex()}")
+
         # ── Strategy A: pp1 is the key itself (not encrypted) ──
-        # Try DER import directly
-        try:
-            key = RSA.import_key(pp1_bytes)
-            logger.info("RSA key imported directly from pp1 DER bytes.")
-            return key
-        except Exception as e:
-            logger.debug(f"Direct DER import failed: {e}")
-
-        # Try wrapping pp1 as PEM body (PKCS#1 and PKCS#8 headers)
-        for key_type in ["RSA PUBLIC KEY", "PUBLIC KEY"]:
+        for attempt_name, attempt_fn in [
+            ("DER", lambda: RSA.import_key(pp1_bytes)),
+            ("PEM_PKCS8", lambda: RSA.import_key(
+                f"-----BEGIN PUBLIC KEY-----\n{pp1}\n-----END PUBLIC KEY-----"
+            )),
+            ("PEM_PKCS1", lambda: RSA.import_key(
+                f"-----BEGIN RSA PUBLIC KEY-----\n{pp1}\n-----END RSA PUBLIC KEY-----"
+            )),
+            ("PEM_direct", lambda: RSA.import_key(pp1) if "BEGIN" in pp1 else None),
+        ]:
             try:
-                pem = f"-----BEGIN {key_type}-----\n{pp1}\n-----END {key_type}-----"
-                key = RSA.import_key(pem)
-                logger.info(f"RSA key imported as PEM ({key_type}) from pp1.")
-                return key
+                key = attempt_fn()
+                if key:
+                    logger.info(f"RSA key imported directly ({attempt_name}).")
+                    return key
             except Exception as e:
-                logger.debug(f"PEM wrap ({key_type}) failed: {e}")
+                logger.debug(f"Direct import ({attempt_name}) failed: {e}")
 
-        # Try pp1 string directly (might already be a PEM)
-        if "BEGIN" in pp1 and "KEY" in pp1:
-            try:
-                key = RSA.import_key(pp1)
-                logger.info("pp1 was already a PEM string.")
-                return key
-            except Exception as e:
-                logger.debug(f"Direct PEM failed: {e}")
+        # ── Strategy B: pp1 bytes are raw RSA modulus (256 or 257 bytes) ──
+        # Some API versions return the raw modulus; exponent is assumed 65537
+        if len(pp1_bytes) in (256, 257, 512, 513):
+            for start_offset in (0, 1):
+                try:
+                    mod_bytes = pp1_bytes[start_offset:]
+                    n = int.from_bytes(mod_bytes, byteorder='big')
+                    e = 65537
+                    key = RSA.construct((n, e))
+                    logger.info(
+                        f"RSA key constructed from raw modulus "
+                        f"(offset={start_offset}, len={len(mod_bytes)})."
+                    )
+                    return key
+                except Exception as ex:
+                    logger.debug(f"Raw modulus (offset={start_offset}) failed: {ex}")
 
-        # ── Strategy B: pp1 is AES-encrypted with pp2 ──
+        # ── Strategy C: AES decryption (stream/block modes) with pp2 ──
         logger.info("Direct key import failed, trying AES decryption...")
 
-        # Build candidate AES keys from pp2
-        candidate_keys = []
         raw_pp2 = pp2.encode("utf-8")
+        candidate_keys = []
 
         if len(raw_pp2) in (16, 24, 32):
             candidate_keys.append(("raw_pp2", raw_pp2))
-
         try:
-            decoded_pp2 = base64.b64decode(pp2 + "=" * ((4 - len(pp2) % 4) % 4))
-            if len(decoded_pp2) in (16, 24, 32):
-                candidate_keys.append(("b64_pp2", decoded_pp2))
+            d = base64.b64decode(pp2 + "=" * ((4 - len(pp2) % 4) % 4))
+            if len(d) in (16, 24, 32):
+                candidate_keys.append(("b64_pp2", d))
         except Exception:
             pass
-
-        try:
-            decoded_pp2_url = _url_safe_b64decode(pp2)
-            if len(decoded_pp2_url) in (16, 24, 32):
-                candidate_keys.append(("urlsafe_b64_pp2", decoded_pp2_url))
-        except Exception:
-            pass
-
         candidate_keys.append(("md5_pp2", hashlib.md5(raw_pp2).digest()))
 
-        # Try all combinations of key, IV, and mode
+        def _try_import(raw: bytes) -> RSA.RsaKey | None:
+            """Try to import raw bytes as RSA key in various ways."""
+            # As DER
+            try:
+                return RSA.import_key(raw)
+            except Exception:
+                pass
+            # As PEM text
+            try:
+                text = raw.decode("utf-8", errors="ignore").strip()
+                if "BEGIN" in text and "KEY" in text:
+                    return RSA.import_key(text)
+            except Exception:
+                pass
+            # As base64-encoded DER (double-encoded)
+            try:
+                text = raw.decode("ascii", errors="ignore").strip()
+                der = base64.b64decode(text + "=" * ((4 - len(text) % 4) % 4))
+                return RSA.import_key(der)
+            except Exception:
+                pass
+            # Wrap as PEM
+            try:
+                text = raw.decode("ascii", errors="ignore").strip()
+                pem = f"-----BEGIN PUBLIC KEY-----\n{text}\n-----END PUBLIC KEY-----"
+                return RSA.import_key(pem)
+            except Exception:
+                pass
+            return None
+
         for key_name, key_bytes in candidate_keys:
-            iv_strategies = [
+            iv_list = [
                 ("key_as_iv", key_bytes[:16]),
                 ("zeros_iv", b'\x00' * 16),
             ]
             if len(pp1_bytes) > 16:
-                iv_strategies.insert(0, ("pp1_prefix_iv", pp1_bytes[:16]))
+                iv_list.insert(0, ("pp1_prefix_iv", pp1_bytes[:16]))
 
-            for iv_name, iv in iv_strategies:
+            for iv_name, iv in iv_list:
                 ct = pp1_bytes[16:] if iv_name == "pp1_prefix_iv" else pp1_bytes
 
-                for mode_name, mode_args in [
-                    ("CBC", (AES.MODE_CBC, iv)),
-                    ("ECB", (AES.MODE_ECB,)),
+                # --- Block modes (need padding to 16) ---
+                padded_ct = ct
+                if len(padded_ct) % 16 != 0:
+                    padded_ct += b'\x00' * (16 - len(padded_ct) % 16)
+
+                for mode_name, make_cipher in [
+                    ("CBC", lambda: AES.new(key_bytes, AES.MODE_CBC, iv)),
+                    ("ECB", lambda: AES.new(key_bytes, AES.MODE_ECB)),
                 ]:
-                    padded_ct = ct
-                    if len(padded_ct) % 16 != 0:
-                        padded_ct += b'\x00' * (16 - len(padded_ct) % 16)
-
                     try:
-                        cipher = AES.new(key_bytes, *mode_args)
-                        decrypted = cipher.decrypt(padded_ct)
-
-                        # PKCS7 unpadding
-                        pad_len = decrypted[-1]
-                        if 0 < pad_len <= 16 and all(
-                            b == pad_len for b in decrypted[-pad_len:]
-                        ):
-                            candidate = decrypted[:-pad_len]
-                        else:
-                            candidate = decrypted.rstrip(b'\x00')
-
-                        # Try as PEM text
+                        decrypted = make_cipher().decrypt(padded_ct)
+                        # Try PKCS7 unpad
                         try:
-                            text = candidate.decode("utf-8", errors="ignore")
-                            if "BEGIN" in text and "KEY" in text:
-                                key = RSA.import_key(text.strip())
-                                logger.info(f"AES decrypted RSA key: {key_name}/{iv_name}/{mode_name}")
-                                return key
-                        except Exception:
-                            pass
+                            decrypted = unpad(decrypted, 16, style='pkcs7')
+                        except ValueError:
+                            decrypted = decrypted.rstrip(b'\x00')
 
-                        # Try as DER bytes
-                        try:
-                            key = RSA.import_key(candidate)
-                            logger.info(f"AES decrypted DER key: {key_name}/{iv_name}/{mode_name}")
+                        key = _try_import(decrypted)
+                        if key:
+                            logger.info(f"AES key found: {key_name}/{iv_name}/{mode_name}")
                             return key
-                        except Exception:
-                            pass
-
                     except Exception as e:
                         logger.debug(f"  {key_name}/{iv_name}/{mode_name}: {e}")
 
-        # ── Strategy C: XOR decryption ──
-        # Some implementations use simple XOR of pp1 bytes with pp2 bytes (repeating)
+                # --- Stream modes (no padding needed) ---
+                for mode_name, make_cipher in [
+                    ("CTR", lambda: AES.new(key_bytes, AES.MODE_CTR, nonce=iv[:8])),
+                    ("CFB", lambda: AES.new(key_bytes, AES.MODE_CFB, iv=iv)),
+                    ("OFB", lambda: AES.new(key_bytes, AES.MODE_OFB, iv=iv)),
+                ]:
+                    try:
+                        decrypted = make_cipher().decrypt(ct)
+                        key = _try_import(decrypted)
+                        if key:
+                            logger.info(f"AES key found: {key_name}/{iv_name}/{mode_name}")
+                            return key
+                    except Exception as e:
+                        logger.debug(f"  {key_name}/{iv_name}/{mode_name}: {e}")
+
+        # ── Strategy D: XOR with pp2 ──
         try:
-            xor_key = raw_pp2
-            xor_result = bytes(pp1_bytes[i] ^ xor_key[i % len(xor_key)] for i in range(len(pp1_bytes)))
-
-            # Try as DER
-            try:
-                key = RSA.import_key(xor_result)
-                logger.info("RSA key imported via XOR decryption (DER).")
+            xor_result = bytes(pp1_bytes[i] ^ raw_pp2[i % len(raw_pp2)]
+                               for i in range(len(pp1_bytes)))
+            key = _try_import(xor_result)
+            if key:
+                logger.info("RSA key found via XOR with pp2.")
                 return key
-            except Exception:
-                pass
-
-            # Try as PEM text
-            try:
-                text = xor_result.decode("utf-8", errors="ignore")
-                if "BEGIN" in text and "KEY" in text:
-                    key = RSA.import_key(text.strip())
-                    logger.info("RSA key imported via XOR decryption (PEM).")
-                    return key
-            except Exception:
-                pass
         except Exception as e:
-            logger.debug(f"XOR strategy failed: {e}")
+            logger.debug(f"XOR failed: {e}")
 
         raise RuntimeError(
             f"Could not obtain RSA key from pp1/pp2. "
             f"pp1 decoded len={len(pp1_bytes)}, pp2 len={len(pp2)}, "
-            f"pp1 first 4 bytes hex={pp1_bytes[:4].hex()}, "
-            f"keys tried: {[k[0] for k in candidate_keys]}"
+            f"pp1 first 8 bytes hex={pp1_bytes[:8].hex()}, "
+            f"keys tried: {[k[0] for k in candidate_keys]}. "
+            f"Response data keys: {list(resp_data.keys())}. "
+            f"Consider providing your ndus cookie directly in config.json."
         )
 
     def prelogin(self, email: str) -> dict:
@@ -431,22 +457,37 @@ class TeraBoxAuth:
 def ensure_session() -> str:
     """
     Ensure we have a valid ndus session cookie.
-    1. Check cached session
+    1. Check cached session (including manually provided ndus in config.json)
     2. Validate it with a lightweight API call
     3. If invalid, re-login using stored credentials
     Returns the ndus cookie string.
     """
-    # Try cached session first
+    # Try cached session first (works for manually pasted ndus too)
     ndus = config.get_cached_session()
     if ndus:
-        logger.info("Found cached session, validating...")
+        logger.info("Found cached/manual session, validating...")
         if validate_session(ndus):
-            logger.info("Cached session is valid.")
+            logger.info("Session is valid.")
             return ndus
-        logger.info("Cached session expired, re-logging in...")
+        logger.info("Session expired, attempting re-login...")
 
     # Login with credentials
-    email, password = config.get_credentials()
+    try:
+        email, password = config.get_credentials()
+    except ValueError:
+        raise ValueError(
+            "No valid session and no credentials configured.\n"
+            "Either:\n"
+            "  1. Add your TeraBox email/password to config.json:\n"
+            '     {"email": "you@example.com", "password": "yourpass"}\n'
+            "  2. Or paste your ndus cookie directly into config.json:\n"
+            '     {"ndus": "YOUR_NDUS_COOKIE_FROM_BROWSER"}\n'
+            "\n"
+            "To get your ndus cookie:\n"
+            "  - Login to TeraBox in your browser\n"
+            "  - Open DevTools (F12) → Application → Cookies\n"
+            "  - Copy the value of the 'ndus' cookie"
+        )
     auth = TeraBoxAuth()
     ndus = auth.login(email, password)
     return ndus
