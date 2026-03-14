@@ -129,9 +129,11 @@ class TeraBoxAuth:
     def get_public_key(self) -> RSA.RsaKey:
         """
         Step 1: Get RSA public key from /passport/getpubkey.
-        The key is AES encrypted: decrypt pp1 using pp2 as key.
-        TeraBox uses CryptoJS-style encryption: key and IV are both the raw
-        pp2 string (UTF-8 bytes), pp1 is standard base64 ciphertext.
+        The API may return the key in several ways:
+          - Directly as 'pubkey' field (PEM string)
+          - pp1 as base64 of DER-encoded key (no encryption)
+          - pp1 as base64 PEM body (wrap with headers to get PEM)
+          - pp1 AES-encrypted with pp2 as key
         """
         url = f"{self.host}/passport/getpubkey"
         params = {
@@ -159,25 +161,67 @@ class TeraBoxAuth:
 
         logger.info(f"pp1 length: {len(pp1)}, pp2 length: {len(pp2)}")
 
-        # Build candidate keys to try (in priority order)
+        # Decode pp1 from base64
+        pp1_bytes = None
+        for decode_name, decode_fn in [
+            ("std_b64", lambda s: base64.b64decode(s + "=" * ((4 - len(s) % 4) % 4))),
+            ("urlsafe_b64", _url_safe_b64decode),
+        ]:
+            try:
+                pp1_bytes = decode_fn(pp1)
+                logger.info(f"pp1 decoded ({decode_name}): {len(pp1_bytes)} bytes")
+                break
+            except Exception as e:
+                logger.debug(f"pp1 decode ({decode_name}) failed: {e}")
+
+        if pp1_bytes is None:
+            raise RuntimeError("Could not base64-decode pp1")
+
+        # ── Strategy A: pp1 is the key itself (not encrypted) ──
+        # Try DER import directly
+        try:
+            key = RSA.import_key(pp1_bytes)
+            logger.info("RSA key imported directly from pp1 DER bytes.")
+            return key
+        except Exception as e:
+            logger.debug(f"Direct DER import failed: {e}")
+
+        # Try wrapping pp1 as PEM body (PKCS#1 and PKCS#8 headers)
+        for key_type in ["RSA PUBLIC KEY", "PUBLIC KEY"]:
+            try:
+                pem = f"-----BEGIN {key_type}-----\n{pp1}\n-----END {key_type}-----"
+                key = RSA.import_key(pem)
+                logger.info(f"RSA key imported as PEM ({key_type}) from pp1.")
+                return key
+            except Exception as e:
+                logger.debug(f"PEM wrap ({key_type}) failed: {e}")
+
+        # Try pp1 string directly (might already be a PEM)
+        if "BEGIN" in pp1 and "KEY" in pp1:
+            try:
+                key = RSA.import_key(pp1)
+                logger.info("pp1 was already a PEM string.")
+                return key
+            except Exception as e:
+                logger.debug(f"Direct PEM failed: {e}")
+
+        # ── Strategy B: pp1 is AES-encrypted with pp2 ──
+        logger.info("Direct key import failed, trying AES decryption...")
+
+        # Build candidate AES keys from pp2
         candidate_keys = []
         raw_pp2 = pp2.encode("utf-8")
 
-        # CryptoJS pattern: raw string as key (if 16/24/32 bytes)
         if len(raw_pp2) in (16, 24, 32):
             candidate_keys.append(("raw_pp2", raw_pp2))
 
-        # Base64-decoded pp2
         try:
-            decoded_pp2 = base64.b64decode(
-                pp2 + "=" * ((4 - len(pp2) % 4) % 4)
-            )
+            decoded_pp2 = base64.b64decode(pp2 + "=" * ((4 - len(pp2) % 4) % 4))
             if len(decoded_pp2) in (16, 24, 32):
                 candidate_keys.append(("b64_pp2", decoded_pp2))
         except Exception:
             pass
 
-        # URL-safe base64 decoded pp2
         try:
             decoded_pp2_url = _url_safe_b64decode(pp2)
             if len(decoded_pp2_url) in (16, 24, 32):
@@ -185,52 +229,24 @@ class TeraBoxAuth:
         except Exception:
             pass
 
-        # MD5 fallback (always 16 bytes)
         candidate_keys.append(("md5_pp2", hashlib.md5(raw_pp2).digest()))
 
-        # Decode pp1 ciphertext — try standard base64, then URL-safe
-        cipher_bytes = None
-        for decode_name, decode_fn in [
-            ("std_b64", lambda s: base64.b64decode(s + "=" * ((4 - len(s) % 4) % 4))),
-            ("urlsafe_b64", _url_safe_b64decode),
-        ]:
-            try:
-                cipher_bytes = decode_fn(pp1)
-                logger.info(f"pp1 decoded ({decode_name}): {len(cipher_bytes)} bytes")
-                break
-            except Exception as e:
-                logger.debug(f"pp1 decode ({decode_name}) failed: {e}")
-
-        if cipher_bytes is None:
-            raise RuntimeError("Could not base64-decode pp1")
-
-        # Try all combinations of key, IV strategy, and AES mode
-        pem_key = None
-
+        # Try all combinations of key, IV, and mode
         for key_name, key_bytes in candidate_keys:
-            if pem_key:
-                break
-
             iv_strategies = [
                 ("key_as_iv", key_bytes[:16]),
                 ("zeros_iv", b'\x00' * 16),
             ]
-            if len(cipher_bytes) > 16:
-                iv_strategies.insert(0, ("pp1_prefix_iv", cipher_bytes[:16]))
+            if len(pp1_bytes) > 16:
+                iv_strategies.insert(0, ("pp1_prefix_iv", pp1_bytes[:16]))
 
             for iv_name, iv in iv_strategies:
-                if pem_key:
-                    break
-
-                ct = cipher_bytes[16:] if iv_name == "pp1_prefix_iv" else cipher_bytes
+                ct = pp1_bytes[16:] if iv_name == "pp1_prefix_iv" else pp1_bytes
 
                 for mode_name, mode_args in [
                     ("CBC", (AES.MODE_CBC, iv)),
                     ("ECB", (AES.MODE_ECB,)),
                 ]:
-                    if pem_key:
-                        break
-
                     padded_ct = ct
                     if len(padded_ct) % 16 != 0:
                         padded_ct += b'\x00' * (16 - len(padded_ct) % 16)
@@ -244,27 +260,63 @@ class TeraBoxAuth:
                         if 0 < pad_len <= 16 and all(
                             b == pad_len for b in decrypted[-pad_len:]
                         ):
-                            candidate = decrypted[:-pad_len].decode("utf-8", errors="ignore")
+                            candidate = decrypted[:-pad_len]
                         else:
-                            candidate = decrypted.rstrip(b'\x00').decode("utf-8", errors="ignore")
+                            candidate = decrypted.rstrip(b'\x00')
 
-                        if "BEGIN" in candidate and "KEY" in candidate:
-                            pem_key = candidate.strip()
-                            logger.info(
-                                f"Decrypted RSA key: key={key_name}, iv={iv_name}, mode={mode_name}"
-                            )
+                        # Try as PEM text
+                        try:
+                            text = candidate.decode("utf-8", errors="ignore")
+                            if "BEGIN" in text and "KEY" in text:
+                                key = RSA.import_key(text.strip())
+                                logger.info(f"AES decrypted RSA key: {key_name}/{iv_name}/{mode_name}")
+                                return key
+                        except Exception:
+                            pass
+
+                        # Try as DER bytes
+                        try:
+                            key = RSA.import_key(candidate)
+                            logger.info(f"AES decrypted DER key: {key_name}/{iv_name}/{mode_name}")
+                            return key
+                        except Exception:
+                            pass
+
                     except Exception as e:
                         logger.debug(f"  {key_name}/{iv_name}/{mode_name}: {e}")
 
-        if pem_key is None or "KEY" not in pem_key.upper():
-            raise RuntimeError(
-                f"Could not decrypt RSA key from pp1/pp2. "
-                f"pp1 decoded len={len(cipher_bytes)}, "
-                f"keys tried: {[k[0] for k in candidate_keys]}"
-            )
+        # ── Strategy C: XOR decryption ──
+        # Some implementations use simple XOR of pp1 bytes with pp2 bytes (repeating)
+        try:
+            xor_key = raw_pp2
+            xor_result = bytes(pp1_bytes[i] ^ xor_key[i % len(xor_key)] for i in range(len(pp1_bytes)))
 
-        logger.info("RSA public key obtained.")
-        return RSA.import_key(pem_key)
+            # Try as DER
+            try:
+                key = RSA.import_key(xor_result)
+                logger.info("RSA key imported via XOR decryption (DER).")
+                return key
+            except Exception:
+                pass
+
+            # Try as PEM text
+            try:
+                text = xor_result.decode("utf-8", errors="ignore")
+                if "BEGIN" in text and "KEY" in text:
+                    key = RSA.import_key(text.strip())
+                    logger.info("RSA key imported via XOR decryption (PEM).")
+                    return key
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"XOR strategy failed: {e}")
+
+        raise RuntimeError(
+            f"Could not obtain RSA key from pp1/pp2. "
+            f"pp1 decoded len={len(pp1_bytes)}, pp2 len={len(pp2)}, "
+            f"pp1 first 4 bytes hex={pp1_bytes[:4].hex()}, "
+            f"keys tried: {[k[0] for k in candidate_keys]}"
+        )
 
     def prelogin(self, email: str) -> dict:
         """
