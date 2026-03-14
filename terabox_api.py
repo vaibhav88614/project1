@@ -67,15 +67,16 @@ class TeraBoxAPI:
             "Accept": "application/json, text/plain, */*",
             "Referer": f"{self.host}/",
         })
-        self.session.cookies.set("ndus", ndus, domain=".terabox.com")
+        if ndus:
+            self.session.cookies.set("ndus", ndus, domain=".terabox.com")
+            self.session.cookies.set("ndus", ndus, domain=".terabox.app")
 
     def _get_headers(self) -> dict:
-        """Get common request headers."""
+        """Get common request headers (no Cookie — let session handle cookies)."""
         return {
             "User-Agent": config.USER_AGENT,
             "Accept": "application/json, text/plain, */*",
             "Referer": f"{self.host}/",
-            "Cookie": f"ndus={self.ndus}",
         }
 
     def resolve_share_url(self, share_url: str) -> dict:
@@ -185,7 +186,7 @@ class TeraBoxAPI:
         }
 
         logger.info(f"Fetching file list for surl={surl}, page={page}...")
-        resp = self.session.get(url, params=params, headers=self._get_headers(), timeout=30)
+        resp = self.session.get(url, params=params, timeout=30)
         data = resp.json()
 
         errno = data.get("errno", -1)

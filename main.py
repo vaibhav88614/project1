@@ -209,18 +209,19 @@ def cli_download(url: str, output_dir: str = None):
         print("  Supported domains: terabox.com, 1024tera.com, freeterabox.com, etc.")
         sys.exit(1)
 
-    # Login
+    # Login (optional — try first, fall back to unauthenticated for public shares)
+    ndus = None
     print("[*] Authenticating...")
     try:
         ndus = auth.ensure_session()
         print("[+] Authentication successful.\n")
     except Exception as e:
-        print(f"[ERROR] Authentication failed: {e}")
-        sys.exit(1)
+        print(f"[!] Authentication failed: {e}")
+        print("[*] Trying unauthenticated mode for public share...\n")
 
     # Resolve URL
     print(f"[*] Resolving: {url}")
-    api = TeraBoxAPI(ndus)
+    api = TeraBoxAPI(ndus or "")
 
     try:
         files = api.get_download_link(url)
