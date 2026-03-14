@@ -150,7 +150,19 @@ class TeraBoxAuth:
         pp2 = data["data"]["pp2"]
 
         # AES-128-CBC decrypt pp1 using pp2
-        key_bytes = _url_safe_b64decode(pp2)
+        # pp2 may be base64-encoded or a raw string key.
+        # Try base64 first; if the decoded length is not a valid AES key
+        # length (16/24/32), fall back to using raw UTF-8 bytes or MD5 hash.
+        try:
+            key_bytes = _url_safe_b64decode(pp2)
+        except Exception:
+            key_bytes = pp2.encode("utf-8")
+
+        if len(key_bytes) not in (16, 24, 32):
+            # Use MD5 of pp2 to derive a 16-byte AES-128 key
+            key_bytes = hashlib.md5(pp2.encode("utf-8")).digest()
+            logger.info(f"Derived AES key via MD5 (pp2 raw len was not 16/24/32)")
+
         cipher_bytes = _url_safe_b64decode(pp1)
 
         # IV is the first 16 bytes
