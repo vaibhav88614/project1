@@ -9,3 +9,5 @@ __pycache__/
 config.json
 downloads/
 *.png
+*.session
+*.xlsx

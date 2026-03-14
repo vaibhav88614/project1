@@ -2,3 +2,5 @@ flask
 requests
 pycryptodome
 playwright
+openpyxl
+telethon
