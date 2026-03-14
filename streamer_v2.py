@@ -1,11 +1,10 @@
 """
 TeraBox Streamer Download v2 — via teraboxstreamer.com
 
-Enhanced version with techniques from Cloudflare Turnstile bypass research:
-  - navigator.webdriver removal & full stealth patches
-  - window.turnstile.render interception (captures sitekey, cData, chlPageData)
-  - cfCallback injection for programmatic token submission
-  - Retry logic with fresh browser contexts
+Enhanced version with:
+  - Multi-browser rotation (Chrome, Edge) to reduce detection
+  - Retry Download click when captcha is solved but API fails
+  - navigator.webdriver removal (minimal stealth)
   - Fallback click on Turnstile widget
   - Full file download with progress bar and speed display
 
@@ -30,24 +29,27 @@ STREAMER_URL = "https://teraboxstreamer.com/"
 
 # Minimal stealth injection — only remove webdriver flag.
 # NOTE: Aggressive fingerprint overrides (plugins, languages, chrome object)
-# actually TRIGGER Cloudflare detection. Real Chrome + minimal patch = best.
-# The turnstile.render interception from the article is useful for PAID captcha
-# services but unnecessary when using real Chrome that auto-solves Turnstile.
+# actually TRIGGER Cloudflare detection. Real Chrome/Edge + minimal patch = best.
 STEALTH_JS = """
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     try { delete navigator.__proto__.webdriver; } catch(e) {}
 """
 
+# Browser rotation: cycle through available real browsers
+# Playwright channels: "chrome", "msedge", "chromium" (bundled fallback)
+BROWSER_CHANNELS = ["chrome", "msedge", "chrome", "msedge"]
+
 
 def get_download_link(terabox_url: str, max_retries: int = 3) -> dict:
     """
     Get a direct download link for a TeraBox URL.
-    Retries with fresh browser context on failure.
+    Rotates browsers (Chrome/Edge) across retries to reduce detection.
     """
     result = {}
     for attempt in range(1, max_retries + 1):
-        logger.info(f"=== Attempt {attempt}/{max_retries} ===")
-        result = _try_get_download_link(terabox_url)
+        channel = BROWSER_CHANNELS[(attempt - 1) % len(BROWSER_CHANNELS)]
+        logger.info(f"=== Attempt {attempt}/{max_retries} (browser: {channel}) ===")
+        result = _try_get_download_link(terabox_url, channel=channel)
         if "download_url" in result or "m3u8_url" in result:
             return result
         if attempt < max_retries:
@@ -56,20 +58,36 @@ def get_download_link(terabox_url: str, max_retries: int = 3) -> dict:
     return result
 
 
-def _try_get_download_link(terabox_url: str) -> dict:
-    """Single attempt to obtain the download link."""
+def _try_get_download_link(terabox_url: str, channel: str = "chrome") -> dict:
+    """Single attempt to obtain the download link using specified browser."""
     with sync_playwright() as p:
-        logger.info("Launching real Chrome...")
-        browser = p.chromium.launch(
-            channel="chrome",
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-infobars",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        logger.info(f"Launching {channel}...")
+
+        # Launch the specified browser
+        try:
+            browser = p.chromium.launch(
+                channel=channel,
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-infobars",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+        except Exception as e:
+            logger.warning(f"Failed to launch {channel}: {e}. Falling back to chrome.")
+            browser = p.chromium.launch(
+                channel="chrome",
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-infobars",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             locale="en-US",
@@ -89,7 +107,11 @@ def _try_get_download_link(terabox_url: str) -> dict:
                 try:
                     data = response.json()
                     logger.info(f"API Response from {url.split('?')[0]}:\n{json.dumps(data, indent=2)}")
-                    api_results.update(data)
+                    # Only update if we got a download_url, or if api_results is empty
+                    if "download_url" in data:
+                        api_results.update(data)
+                    elif "download_url" not in api_results:
+                        api_results.update(data)
                 except Exception:
                     pass
 
@@ -106,7 +128,7 @@ def _try_get_download_link(terabox_url: str) -> dict:
             page.fill("#url", terabox_url)
 
             # ── Wait for Turnstile to auto-solve ──
-            logger.info("Waiting for Turnstile to solve (real Chrome auto-solves in ~5s)...")
+            logger.info("Waiting for Turnstile to solve...")
             token = _wait_for_turnstile_token(page, timeout=45)
 
             if not token:
@@ -120,30 +142,60 @@ def _try_get_download_link(terabox_url: str) -> dict:
                 browser.close()
                 return {"error": "Turnstile captcha not solved"}
 
-            # ── Click Download ──
-            logger.info("Clicking Download button...")
-            page.click('button:has-text("Download")')
+            # ── Click Download (with retry if API fails but captcha was solved) ──
+            max_download_clicks = 3
+            for click_attempt in range(1, max_download_clicks + 1):
+                logger.info(f"Clicking Download button (click {click_attempt}/{max_download_clicks})...")
 
-            # ── Wait for API response ──
-            logger.info("Waiting for download link...")
-            for i in range(90):
-                if "download_url" in api_results:
-                    break
-                if "error" in api_results:
-                    logger.warning(f"API error: {api_results.get('error')}")
+                # Clear previous error keys (keep download_url if somehow set)
+                api_results.pop("detail", None)
+                api_results.pop("error", None)
+
+                page.click('button:has-text("Download")')
+
+                # ── Wait for API response ──
+                got_result = False
+                for i in range(90):
+                    if "download_url" in api_results:
+                        got_result = True
+                        break
+
+                    # Check for error response from API
+                    if "detail" in api_results or "error" in api_results:
+                        error_detail = api_results.get("detail", api_results.get("error", ""))
+                        logger.warning(f"API returned error: {error_detail}")
+                        break
+
+                    # Also check if link appeared in the page DOM
+                    dl = page.evaluate(
+                        '() => { const a = document.querySelector("#download-result a"); return a ? a.href : ""; }'
+                    )
+                    if dl:
+                        api_results["download_url"] = dl
+                        got_result = True
+                        break
+
+                    if i % 10 == 0:
+                        logger.info(f"  Waiting for response... ({i}s)")
+                    time.sleep(1)
+
+                if got_result and "download_url" in api_results:
+                    logger.info(f"Download URL obtained!")
                     break
 
-                # Also check if link appeared in the page DOM
-                dl = page.evaluate(
-                    '() => { const a = document.querySelector("#download-result a"); return a ? a.href : ""; }'
-                )
-                if dl:
-                    api_results["download_url"] = dl
-                    break
-
-                if i % 10 == 0:
-                    logger.info(f"  Waiting for response... ({i}s)")
-                time.sleep(1)
+                # API failed but captcha was solved — check if token is still valid
+                if click_attempt < max_download_clicks:
+                    current_token = page.evaluate(
+                        '() => { const el = document.querySelector("input[name=cf-turnstile-response]"); '
+                        "return el ? el.value : ''; }"
+                    )
+                    if current_token:
+                        logger.info(f"Captcha still valid (token length: {len(current_token)}). "
+                                    f"Retrying Download click in 3s...")
+                        time.sleep(3)
+                    else:
+                        logger.warning("Captcha token expired. Need fresh attempt.")
+                        break
 
             logger.info(f"Result: {json.dumps(api_results, indent=2)}")
 
