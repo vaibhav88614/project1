@@ -149,10 +149,10 @@ class TeraBoxAuth:
         pp1 = data["data"]["pp1"]
         pp2 = data["data"]["pp2"]
 
+        logger.info(f"pp1 length: {len(pp1)}, pp2 length: {len(pp2)}")
+
         # AES-128-CBC decrypt pp1 using pp2
         # pp2 may be base64-encoded or a raw string key.
-        # Try base64 first; if the decoded length is not a valid AES key
-        # length (16/24/32), fall back to using raw UTF-8 bytes or MD5 hash.
         try:
             key_bytes = _url_safe_b64decode(pp2)
         except Exception:
@@ -161,20 +161,69 @@ class TeraBoxAuth:
         if len(key_bytes) not in (16, 24, 32):
             # Use MD5 of pp2 to derive a 16-byte AES-128 key
             key_bytes = hashlib.md5(pp2.encode("utf-8")).digest()
-            logger.info(f"Derived AES key via MD5 (pp2 raw len was not 16/24/32)")
+            logger.info("Derived AES key via MD5 (pp2 decoded len was not 16/24/32)")
 
         cipher_bytes = _url_safe_b64decode(pp1)
 
-        # IV is the first 16 bytes
-        iv = cipher_bytes[:16]
-        encrypted = cipher_bytes[16:]
+        # Try multiple IV strategies: pp1 may or may not have IV prepended.
+        pem_key = None
 
-        cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
+        # Strategy 1: IV is first 16 bytes of cipher_bytes
+        if len(cipher_bytes) > 16 and (len(cipher_bytes) - 16) % 16 == 0:
+            iv = cipher_bytes[:16]
+            encrypted = cipher_bytes[16:]
+            try:
+                cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+                decrypted = cipher.decrypt(encrypted)
+                pad_len = decrypted[-1]
+                if 0 < pad_len <= 16:
+                    pem_key = decrypted[:-pad_len].decode("utf-8")
+                    logger.info("Decrypted with IV from pp1 prefix.")
+            except Exception as e:
+                logger.debug(f"Strategy 1 (IV from pp1) failed: {e}")
 
-        # Remove PKCS7 padding
-        pad_len = decrypted[-1]
-        pem_key = decrypted[:-pad_len].decode("utf-8")
+        # Strategy 2: IV = key itself (first 16 bytes), entire pp1 is ciphertext
+        if pem_key is None:
+            iv = key_bytes[:16]
+            encrypted = cipher_bytes
+            # Pad ciphertext to 16-byte boundary if needed
+            if len(encrypted) % 16 != 0:
+                encrypted = encrypted + b'\x00' * (16 - len(encrypted) % 16)
+            try:
+                cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+                decrypted = cipher.decrypt(encrypted)
+                pad_len = decrypted[-1]
+                if 0 < pad_len <= 16:
+                    pem_key = decrypted[:-pad_len].decode("utf-8")
+                else:
+                    pem_key = decrypted.rstrip(b'\x00').decode("utf-8")
+                logger.info("Decrypted with IV from key bytes.")
+            except Exception as e:
+                logger.debug(f"Strategy 2 (IV from key) failed: {e}")
+
+        # Strategy 3: Zero IV, entire pp1 is ciphertext
+        if pem_key is None:
+            iv = b'\x00' * 16
+            encrypted = cipher_bytes
+            if len(encrypted) % 16 != 0:
+                encrypted = encrypted + b'\x00' * (16 - len(encrypted) % 16)
+            try:
+                cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+                decrypted = cipher.decrypt(encrypted)
+                pad_len = decrypted[-1]
+                if 0 < pad_len <= 16:
+                    pem_key = decrypted[:-pad_len].decode("utf-8")
+                else:
+                    pem_key = decrypted.rstrip(b'\x00').decode("utf-8")
+                logger.info("Decrypted with zero IV.")
+            except Exception as e:
+                logger.debug(f"Strategy 3 (zero IV) failed: {e}")
+
+        if pem_key is None or "KEY" not in pem_key.upper():
+            raise RuntimeError(
+                f"Could not decrypt RSA key from pp1/pp2. "
+                f"pp1 decoded len={len(cipher_bytes)}, key len={len(key_bytes)}"
+            )
 
         logger.info("RSA public key obtained.")
         return RSA.import_key(pem_key)
