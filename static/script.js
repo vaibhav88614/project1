@@ -25,6 +25,7 @@ const SUPPORTED_DOMAINS = [
     'terabox.com', 'terabox.app', 'terabox.fun', 'teraboxapp.com',
     '1024tera.com', '1024terabox.com', 'freeterabox.com', 'mirrobox.com',
     'nephobox.com', '4funbox.co', 'momerybox.com', 'tibibox.com',
+    'terasharefile.com',
 ];
 
 // ─── Init ───────────────────────────────────────────────────────────────────
