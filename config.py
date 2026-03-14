@@ -37,6 +37,7 @@ SUPPORTED_DOMAINS = [
     "4funbox.co", "www.4funbox.co",
     "momerybox.com", "www.momerybox.com",
     "tibibox.com", "www.tibibox.com",
+    "terasharefile.com", "www.terasharefile.com",
 ]
 
 # Download settings
